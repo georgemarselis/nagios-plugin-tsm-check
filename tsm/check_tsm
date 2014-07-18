@@ -1,0 +1,1703 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Data::Dumper;
+use DateTime;
+use DateTime::Format::Strptime;
+use Time::Piece;
+use Number::Bytes::Human;
+use Socket;
+# use Sys::Hostname::FQDN qw{
+# 	fqdn
+# };
+
+use Config; # detect os
+
+## Packages
+use Nagios::Plugin;
+
+my $dsmadmc = '/usr/sbin/dsmadmc';
+my $n = '';
+my $isoutfileused = '';
+my $node = ''; 
+my $password = '';
+
+###
+# Text output parser function
+sub dsmadmc {
+
+	my $id 			= '-id='.$node;        # case indifferent here
+	my $passwd 		= '-password='.$password;
+	my $displaymode	= '-displaymode=list'; # sorry folks, table breaks my parser.
+	my $query 		= $_[0];
+	my $outfile 	= '-outfile';
+
+	if( $n->opts->outfile ) {
+		$outfile 		= '-outfile='.$n->opts->outfile;
+		$isoutfileused 	= "true";
+	}
+
+	my @args 	= ( $id, $passwd, $displaymode, $outfile, $query ) ;
+
+	open( my $dsmadmc_handle, '-|', $n->opts->dsmadmc, @args ) or
+		$n->nagios_exit( CRITICAL, "Cannot run '$n->opts->dsmadmc': $!" );
+
+	# no reason to continue with the checks if there is a file supplied.
+	#	... meaning that in the future we will have to parse the file?
+	if( $outfile eq "true" ) {
+		$n->nagios_exit( WARNING, "NAGIOS check disabled, using output file $n->opts->outfile for output");
+		return;
+	}
+
+	# read in output
+	my @output = <$dsmadmc_handle>; 
+	close( $dsmadmc_handle );
+
+	errorhandling( @output );
+	
+	my @usefuloutput = strip_copyright( @output );
+
+	return parse( @usefuloutput );
+}
+
+
+
+#
+# perform rudimentary error handling 
+# 	if an error is found, program quits.
+sub errorhandling {
+
+	my @dsmadmc_output = @_;
+
+	foreach( @dsmadmc_output ) {
+
+		/^ANS1035S/ and do {
+			$n->nagios_exit( CRITICAL, "$0: Options file \'/opt/tivoli/tsm/client/ba/bin/dsm.sys\' could not be found, or it cannot be read");
+			last;
+		};
+
+		/^ANS0990W/ and do {
+			$n->nagios_exit( CRITICAL, "$0: Options file \'/opt/tivoli/tsm/client/ba/bin/dsm.opt\' could not be found." );
+			last;
+		};
+
+		# ANS8019E: http://www-01.ibm.com/support/docview.wss?uid=swg21450021
+		/^ANS8019E/ and do {
+			$n->nagios_exit( CRITICAL, "$0: Wrong or none id and/or password supplied");
+			last;
+		};
+		
+		/^ANR0162W/ and do {
+			$n->nagios_exit( CRITICAL, "$0: SQL Query passed is formatted wrong: You probably allowed spaces around the operators");
+			last;
+		};
+
+		/^ANS1357S/ and do {  # do not use the client from different operating systems
+			$n->nagios_exit( CRITICAL, "$0: Session rejected: Downlevel client code version" );
+			last;
+		};
+
+		/^ANS1398E/ and do {
+			$n->nagios_exit( CRITICAL, "$0: Initialization functions cannot open one of the Tivoli ".
+				"Storage Manager logs or a related file: /opt/tivoli/tsm/client/ba/bin/logs/dsmerror.log" );
+		};
+
+		/^ANS1520E/ and do { # error writing to TSM error log
+			$n->nagios_exit( CRITICAL, "$0: Failure writing to the Tivoli Storage Manager error log: errno = 13, Permission denied" );
+			last;
+		};
+
+
+		if( ! @dsmadmc_output ) {
+			$n->nagios_exit( CRITICAL, "dsmadmc did not return any output")
+		}
+
+	}
+
+	return;
+
+}
+
+sub strip_copyright {
+
+	my @output 			= @_;
+	my @usefuloutput 	= ( );
+	my $parsing  		= "";
+	my $usefulnull 		= "";
+
+	foreach ( @output ) {
+
+		/^\n/ and do { # skip empty lines
+			next unless( $parsing );
+		};
+
+		# skip copyright and connection notices
+		/^(IBM\sTivoli\sStorage|Command\sLine|\(c\)\sCopyright.*|Session\sestablished.*|\s{2}Server\s+.*)/ and do {
+			next;
+		};
+
+		## Server connection and Server reply
+		# Checking for !ANS\d{4}I
+		/^ANS8000(I)\ Server\ command:.*$/ and do
+		{
+			if( $1 ne "I" ) {
+				$n->nagios_exit( CRITICAL, "Server Connection did not return ANSI8000I: $_ ");
+				return;
+			}
+			next;
+		};
+
+		# Server return status
+		#	Exit with CRITICAL if server does not respond with 0;
+		/^ANS8002I.*was (\d+)\.$/ and do
+		{
+
+			$parsing = "ended";
+
+			$usefulnull and do {
+				$usefulnull = '';
+				@usefuloutput = ( );
+				next;
+			};
+
+			if( $1 > 0 ) {
+				$n->nagios_exit( CRITICAL, "binary exited: highest error reported: $1");
+				return;
+			}
+			next;
+		};
+
+		# No such selection as query specified
+		/^ANR2034E\s(.*)\.$/ and do {
+			
+			my $tmpstatus = $1;
+			my ( $tmpquery ) = $output[8] =~ m/^ANS8000I\ Server\ command:\ (.*)\.$/;
+
+			$tmpquery =~ /error_state/  and do {
+				$usefulnull = "yes";
+				next;
+			};
+
+			$n->nagios_exit( CRITICAL, $tmpstatus."! Query used: ".$tmpquery );
+		};
+
+		/^((?!ANS[REI]\d{2}).)*$/ and do {
+			$parsing = "started";
+			push @usefuloutput, $_;	
+		};
+
+	}
+
+	return @usefuloutput;
+}
+
+sub parse {
+
+	my @input 			= @_;
+	my %usefuloutput 	= ( );
+	my $section			= 0;
+	my $newline1 		= "not set";
+	my $newline2 		= "";
+	my $key 			= "";
+	my $value 			= "";
+
+	foreach ( @input ) {
+
+		$newline2 and last;
+
+		/^\n$/ and do { 
+
+			$newline1 eq "not set" and do {
+				$section++;
+				$newline1 = "set";
+				next;
+			};
+
+			# end record
+			$newline1 eq "set" and do {
+				$newline2 = "set";
+				next;
+			};
+		};
+
+		$newline1 = "not set";
+
+		# get key/value, trim, assign
+		( $key, $value ) = split( ': ', $_, 2);
+		if( $key ) {
+			$key =~ s/^\s+//;
+			chomp $key ; if( $value ) { chomp $value; }
+			# printf "%s: %s\n", $key, $value; 
+			if( ! $usefuloutput{ $section }{ $key } )			{
+				$usefuloutput{ $section }{ $key } = $value
+			}
+			else {
+				$n->nagios_die( (caller(0))[3].": \$usefuloutput{ '$section' }{ '$key' } already exists.".
+					Dumper( @input )."\n\n".Dumper( %usefuloutput) );
+			}
+		}
+		else {
+			$n->nagios_exit( 'WARNING', sprintf( "key %s: value %s \t\t| key empty at input \'%s\'", $key, $value, $_ ) ) ;
+		}
+	}
+
+	return %usefuloutput;
+	
+}
+
+#
+# instead of polluting main(), have a seperate function to define the
+# the command line arguments of this script
+sub add_arguments {
+
+
+
+	$n->add_arg(
+			spec 		=> 'check=s@',
+			help 		=> "--check {\n".
+								"\t  nightly        | missedfiles     | expiredfiles |\n".
+								"\t  backupduration | totalbackupsize | drivestatus  |\n".
+								"\t  freespace      | tapeset         | tapesro      |\n".
+								"\t  lastbackup     | fullbackup      | volumes      |\n".
+								"\t  writeerrors    | readerrors      | dblogsize    |\n".
+								"\t  dbsize         | filespaces      | scratch      |\n".
+								"\t  numberoffiles  | platform\n".
+								"\t}\n".
+								"   Perform one of the following checks:\n".
+								"\tnightly\n\t\tCheck the status of last night's backup\n".
+								"\tmissedfiles\n\t\tCheck if any files were left out from the backup of last night\n".
+								"\texpiredfiles\n\t\tReport any files were expired from the backup of last night\n".
+								"\tbackupduration\n\t\tReport how long was the duration of the backup\n".
+								"\tbackupsize\n\t\tReport the size of the files backed up, in human-readable form\n".
+								"\tdrivestatus\n\t\tCheck the availability of the alloted tape drives\n".
+								"\tfreespace\n\t\tCheck how much space is free in tape\n\t\t--warning and --critical must also be set\n".
+								"\ttapeset\n\t\tPerform a consistency check on the tape set.\n".
+								"\ttapesro\n\t\tMake sure that no tapes are marked r/o\n".
+								"\tfullbackup\n\t\tCheck if all exported NFS filesystems are backed up.\n".
+								"\tlastbackup\n\t\tCompare the date of the last perfomed backup against the date\n\t\tof the last nightly\n".
+								"\tvolumes\n\t\tPerfdata for individual volume utilization\n".
+								"\twriterrors\n\t\tPerfdata for write errors per volume\n".
+								"\treaderrors\n\t\tPerfdata for read errors per volume\n".
+								"\tdbsize\n\t\tCheck the size of the database log\n".
+								"\tdbspace\n\t\tCheck the size of the database\n".
+								"\tfilespaces\n\t\tKeep track of the sizes and number of files\n\t\tof the individual filespaces backed up\n".
+								"\tscratch\n\t\tCheck if there are enough scratch media\n".
+								"\tnumberoffiles\n\t\tPerfdata for the number of files per filespace.\n".
+								"\tplatform\n\t\tTest client platform against TSM server platform\n".
+								"",
+			required 	=> 1,
+		);
+
+	$n->add_arg(
+			spec 		=> 'warning=i',
+			help 		=> "--warning PERCENT\n".
+							"\tSet the warning threshold, if required by check.\n\tPERCENT must be an integer.\n",
+			required 	=> 0,
+		);
+
+	$n->add_arg(
+			spec 		=> 'critical=i',
+			help 		=> "--critical PERCENT\n".
+							"\tSet the critical threshold, if required by check.\n\tPERCENT must be an integer.\n",
+			required 	=> 0,
+		);
+	
+	$n->add_arg(
+			spec 		=> 'node=s',
+			help 		=> "--node <nodename>\n".
+							"\tThe nodename/username/node ID of the node we are logging in as.\n".
+							"\tIf not set in the command line, the check looks for the".
+							"\t/etc/adsm/check_tsm.pwd file containting username:password\n",
+			required	=> 0,
+		);
+
+	$n->add_arg(
+			spec 		=> 'password=s',
+			help 		=> "--password <setecastronomy>\n".
+							"\tThe password for the nodename/username/node ID of the node\n".
+							"\twe are logging in as.\n".
+							"\tIf not set in the command line, the check looks for the".
+							"\t/etc/adsm/check_tsm.pwd file containting username:password\n",
+			required	=> 0,
+		);
+
+
+	$n->add_arg(
+			spec 		=> 'displaymode=s',
+			help 		=> "--displaymode { list | table }\n".
+							"\tFormat SQL query as\n".
+							"\t* list (one structure per entry) or\n".
+							"\t* table (classic -as of 2014AD- SQL table format).\n".
+							"\tTo see the differences you can run\n".
+							"\t    `dsmadmc -id='yourid' -password='passwd' -displaymode=list  'select * from volumes'`\n\tor\n".
+							"\t    `dsmadmc -id='yourid' -password='passwd' -displaymode=table 'select * from volumes'`\n".
+							"\tDefaults to 'list', as it is easier to parse the records returned.\n",
+			default 	=> "list",
+			required 	=> 0,
+		);
+
+	$n->add_arg(
+			spec 		=> 'outfile|o=s',
+			help 		=> [ "--outfile [<filename>]\n".
+								"\t'outfile' is one of those weird[tm] IBM options.\n".
+								"\tThe IBM TSM Server manual describes -outfile the following two ways: \n".
+								"\t\t-outfile (with no filename option)\n".
+								"\t\t\t`Specifies that output from a server query is formatted\n".
+								"\t\t\tone line per query. This option is available in batch\n".
+								"\t\t\tmode only.`\n",
+
+								"\t\t-outfile=<filename> (with a filename option)\n".
+								"\t\t\t`The output from a server query is redirected to a\n".
+								"\t\t\tspecified file. In batch mode, output is redirected\n".
+								"\t\t\tto a file you specify and the format of the output\n".
+								"\t\t\tmatches the format of the output on your screen.`\n".
+								"\n".
+								"\tThe `hidden` features of this option is that if passed with no argument,\n".
+								"\tit turns off prompting in the admin client.\n".
+								"\tThank you, IBM, for the clarity.\n\n".
+								"\tThe default is to call -outfile with no filename\n"
+							],
+			label 		=> [ '', '<filename>'],
+			required 	=> 0,
+		);
+
+	$n->add_arg(
+			spec 		=> 'platform=s@',
+			help 		=> "--platform { linux | mac } The platform the client should be checked against.\n".
+							"\tThe issue here is allowing cross-platform access to the same account.\n".
+							"\tWhen something like that happens you will get the following error:\n\n".
+							"\t\t`ANS1357S Session rejected: Downlevel client code version`\n\n".
+							"\tThis will be a pain in the ass to resolve, so don't do it.\n\n".
+							"\tIF THIS HAPPENS, YOU HAVE MOST LIKELY MIXED UNICODE AND NON-UNICODE\n".
+							"\tFILESPACES. DELETE THE UNICODE FILESPACES FROM THE ADMIN CLIENT\n".
+							"\tUSING THE FSID OF THE FILESYSTEM\n",
+			required 	=> 1,
+			default 	=> "linux"
+		);
+
+
+	$n->add_arg(
+			spec 		=> 'dsmadmc=s', 
+			help 		=> "Tivoli Storage Manager Backup/Archive Client (default: %s)",
+			default 	=> '/usr/bin/dsmadmc',
+		);
+}
+
+sub main {
+
+	# needs more cowbell^Whelp
+	$n = new Nagios::Plugin (
+
+		usage => "Usage: %s [ -v | --verbose ] \n".
+			"\t\t[ --node <nodename> ] [ --password <setecastronomy> ]\n".
+			"\t\t[ --outfile [filename] ]\n".
+			"\t\t[ --warning n% ]   [ --critical n% ]\n".
+			"\t\t--platform { linux | macosx }\n".
+			"\t\t--check {\n".
+			"\t\t\t  nightly        | missedfiles     | expiredfiles |\n".
+			"\t\t\t  backupduration | totalbackupsize | drivestatus  |\n".
+			"\t\t\t  freespace      | tapeset         | tapesro      |\n".
+			"\t\t\t  lastbackup     | fullbackup      | volumes      |\n".
+			"\t\t\t  writeerrors    | readerrors      | dblogsize    |\n".
+			"\t\t\t  dbsize         | filespaces      | scratch      |\n".
+			"\t\t\t  numberoffiles  | platform\n".
+			"\t\t\t}",
+		license 	=> 'George Marselis <george.marselis@kaust.edu.sa>',
+		shortname 	=> 'TSM',
+		blurb 		=> "Nagios plug-in; checks if the TSM server does what it is supposed to do.",
+		version 	=> '0.6',
+	);
+
+	add_arguments; # dedicated function; keep main clutter-free
+
+	$n->getopts();
+	
+	readusercredentials( );
+
+	#check OS
+	# We do not want to touch a TSM server that is essentially on a different plafrom
+	# than the one the client is running on.
+	# 	If you do, you will have a very bad time	
+	
+	checkplatform( "foo" );
+
+
+	# figure out the options passed to the command-line script.
+		# one option at a time
+	my $dispatch_table = {
+		nightly 		=> \&nightly,
+		missedfiles 	=> \&get_missedfiles,
+		expiredfiles 	=> \&get_expiredfiles,
+		backupduration 	=> \&get_backupduration,
+		totalbackupsize => \&get_totalbackupsize,
+		drivestatus 	=> \&get_drivestatus,
+		freespace 		=> \&get_freespace,
+		tapeset   		=> \&tapeset,
+		tapesro 		=> \&tapesro,
+		lastbackup 		=> \&get_lastbackup,
+		fullbackup 		=> \&allexportedfilesystemsbackedup,
+		platform		=> \&checkplatform,
+		volumes			=> \&queryvolumes,
+		writeerrors 	=> \&queryvolumeswriteerrors,
+		readerrors 		=> \&queryvolumesreaderrors,
+		dblogsize 		=> \&get_dblogsize,
+		dbsize 			=> \&get_dbsize,
+		filespaces 		=> \&get_filespaces,
+		scratch 		=> \&get_scratch,
+		numberoffiles 	=> \&get_numberoffilesperspacefile
+	};
+
+	# Make die return nagios UNKNOWNs
+	$SIG{__DIE__} = sub {
+		$n->nagios_die( join " " => @_ );
+	};
+
+	# test if check exists
+	exists $dispatch_table->{ $n->{opts}->{check}->[0] } or
+		die "$0 :\"$n->{opts}->{check}->[0]\" unknown.";
+
+	# run appropriate check from above dispatch table
+	$n->add_message( $dispatch_table->{ $n->{opts}->{check}->[0] }() );
+
+	$n->nagios_exit( $n->check_messages( join => '. ', join_all => '. ') );
+}
+
+###
+# aux Functions
+
+sub readusercredentials {
+
+	my $adsmpasswdfile = '/etc/adsm/check_tsm.pwd';
+
+	if( -r $adsmpasswdfile ) {
+		# read in username and password
+		open( my $dsmadmc_pwd_handle, '<', $adsmpasswdfile );
+		my @tempinput = <$dsmadmc_pwd_handle>;
+		close $dsmadmc_pwd_handle;
+
+		# make sure nobody tries something dirty
+		if( @tempinput > 1  or @tempinput == 0 ) {
+			$n->nagios_die(  sprintf( (caller(0))[3].
+						": $adsmpasswdfile format not correct: more than one entry, or empty file" ) );
+		}
+
+		( $node, $password ) = split ':', $tempinput[0], 2;
+	}
+	elsif( $n->opts->node and $n->opts->password ) {
+		$node 		.=  $node = $n->opts->node; # case indifferent here
+		$password 	.= $n->opts->password;
+	}
+	else {
+		$n->nagios_die( sprintf( (caller(0))[3].
+			": username and/or password not set: username: %s, password: %s ", $n->opts->node, $n->opts->password ) );
+	}
+
+}
+
+sub checkplatform {
+
+	my $platformquery = "select * from nodes where node_name='".uc( $node )."'";
+
+	my %platformresult = dsmadmc( $platformquery );
+
+	my $clientos = $Config{ 'osname' };
+	if( $clientos eq "darwin" ) { $clientos = "Mac"; }
+	if( $clientos eq "linux"  ) { $clientos = "Linux x86-64"; }
+
+	if( $platformresult{0}{ 'PLATFORM_NAME' } ne $clientos ) {
+
+		$n->add_perfdata( label => 'Client platform matches TSM server', value => 0, critical => 0, min => 0, max => 1 );
+		$n->nagios_exit( CRITICAL, "Platform check/client is not the same as the TSM server!" );
+	}
+
+	if( ! @_ ) {
+		$n->add_perfdata( label => 'Client platform matches TSM server', value => 1, critical => 0, min => 0, max => 1 );
+	}
+
+	# we will have a bad time only if the above fails
+	# 	so, i kept the return type here as plainly explainatory as possible
+	return ( "OK" , "Server platform matches client" );
+}
+
+sub nightly {
+
+	# Critical even if we miss one file
+	my %nightlystate = (
+		Completed	=> 'OK',
+		Missed 		=> 'CRITICAL',
+		Other	  	=> 'CRITICAL',
+		CRITICAL 	=> 'CRITICAL',
+	);
+
+
+	my $status 			= '';
+	my $statusmessage 	= '';
+	my $humanreadable 	= Number::Bytes::Human->new(bs => 1024, si => 0);
+
+	my $yesterday = DateTime->now->subtract( days =>  1 )->ymd;
+
+	my $nightlyquery  	= "select * from activity_summary where ".
+		"entity='".uc( $node )."' and activity='BACKUP' and start_time>\'$yesterday\'";
+
+	my %nightlyresult 	= dsmadmc( $nightlyquery );
+	my $backupduration 	= get_backupduration( %nightlyresult );
+	my $totalfilesize 	= get_totalbackupsize( %nightlyresult ); # returns bytes read
+
+	my @keys 		= keys %nightlyresult;
+	my $hashsize 	= @keys;
+
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		if( $nightlyresult{ $counter }{ 'SUCCESSFUL' } eq 'NO' ) {
+			# do some more fact checking
+			( $status, $statusmessage ) = checkfailedsession( );
+			last;
+			
+		}
+		elsif( $nightlyresult{ $counter }{ 'FAILED' } == 0 and $nightlyresult{ $counter }{ 'SUCCESSFUL' } eq "YES" ) {
+
+			$status 		= 'Completed';
+			$statusmessage 	= "$nightlyresult{ $counter }{ 'EXAMINED' } files examimed, $nightlyresult{ $counter }{ 'AFFECTED' } files affected - ".
+					"Duration: ".sprintf( "%.2f", $backupduration )."h - Backed up: ".$humanreadable->format(  $totalfilesize );
+
+			$n->add_perfdata( label => 'Nightly completed', value => 1, uom => '', min => 0, max => 1 );
+		}
+		elsif( $nightlyresult{ $counter }{ 'FAILED' } >  0 and $nightlyresult{ $counter }{ 'SUCCESSFUL'} eq "YES" ) {
+
+			$status 		= 'Missed';
+			$statusmessage  = "MISSED: $nightlyresult{ $counter }{ 'FAILED' } files (out of $nightlyresult{ $counter }{ 'EXAMINED' } files examined) - ".
+					"Duration: ".sprintf( "%.2f", $backupduration )."h - Backed up: ".$humanreadable->format(  $totalfilesize / ( 1024 * 1024 * 1024 ) );
+
+			$n->add_perfdata( label => 'Nightly completed', value => 0, uom => '', min => 0, max => 1 );
+		}
+		else {
+			$status 		= 'Other';
+			$statusmessage 	= "Nightly Backup failed to complete! ".
+								"query: $nightlyquery\n".
+								"Files examined: ".$nightlyresult{ $counter }{ 'EXAMINED' }."\n".
+								"Files missed:   ".$nightlyresult{ $counter }{ 'FAILED' }."\n";
+
+			if( $nightlyresult{ $counter }{ 'FAILED' } > 0 ) {
+				$statusmessage .= "MISSED: $nightlyresult{ $counter }{ 'FAILED' } files.";
+				$n->add_perfdata( label => 'Files missed', value => int( $nightlyresult{ $counter }{ 'FAILED' } ), uom => '', min => 0, max => 1 );
+			}
+			$n->add_perfdata( label => 'Nightly completed', value => 0, uom => '', min => 0, max => 1 );
+		}
+
+		$n->add_perfdata( label => 'Files examined', value => int( $nightlyresult{ $counter }{ 'EXAMINED' } ), uom => '' );
+		$n->add_perfdata( label => 'Files affected', value => int( $nightlyresult{ $counter }{ 'AFFECTED' } ), uom => '' );
+		$n->add_perfdata( label => 'Backup duration (in hours)', value => sprintf( "%.2f", $backupduration ), uom => '' );
+		$n->add_perfdata( label => 'Backed up data (in GB):', value => sprintf ( "%.2f", $totalfilesize / ( 1024 * 1024 * 1024 ) ), uom => 'GB' );
+
+		$counter++;
+	}
+
+	return $nightlystate{ $status }, $statusmessage;
+
+}
+
+sub checkfailedsession {
+
+	my $status 			= 'CRITICAL';
+	my $statusmessage 	= '';
+	my $yesterday 		= DateTime->now->subtract( days =>  1 )->ymd;
+
+	# get the activity
+	my $errorquery = "select * from activity_summary,actlog where activity_summary.number=actlog.session and ".
+					 "activity_summary.entity='". uc( $node ) ."' and ".
+					 "activity_summary.activity='BACKUP' and ".
+					 "activity_summary.start_time like '".$yesterday ."%'";
+
+	my %errorsummary	= dsmadmc ( $errorquery );
+
+	# print Dumper( %errorsummary );
+	# die;
+
+	my @keys 		= keys %errorsummary;
+	my $hashsize 	= @keys;
+
+	$statusmessage 	= " ";
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		# ignore informational messages
+		$errorsummary{ $counter }{ 'MESSAGE' } =~ /^ANR\d{4}I/ and next;
+
+		# Errors caught here:
+		#
+		# ANR0162W Supplemental database diagnostic information
+		# ANR0106E imbkqry.c(1094): Unexpected error 9999 fetching
+		# 	row in table "Backup.Nameview". (SESSION: $errorsummary{ $counter }{ 'SESSION' })
+		$errorsummary{ $counter }{ 'MESSAGE' } =~ /^ANR\d{4}[EW].*/ and do
+		{
+			$statusmessage .= $errorsummary{ $counter }{ 'MESSAGE' };
+			$statusmessage .= " :: " unless $counter == ($hashsize - 2) ;
+		};
+		
+		$counter++;
+	}
+
+	$statusmessage = $yesterday." ".$statusmessage;
+	# called from the command-line
+	if( ! @_ ) {
+		return $n->nagios_exit( 'CRITICAL' , $statusmessage );
+	}
+
+	return 'CRITICAL', $statusmessage;
+}
+
+sub get_totalbackupsize {
+
+	my %nightlystate = (
+		Completed	=> 'OK',
+		Missed 		=> 'CRITICAL',
+		Other	  	=> 'CRITICAL',
+	);
+
+
+	my $status 			= '';
+	my $statusmessage 	= '';
+
+	my $yesterday = DateTime->now->subtract( days =>  1 )->ymd;
+
+	my $nightlyquery  = "select * from activity_summary where ".
+		"entity='".uc( $node )."' and activity='BACKUP' and start_time>\'$yesterday\'";
+
+	my %tsmobject 		= @_ ? @_ : dsmadmc ( $nightlyquery );
+	my @keys  			= keys %tsmobject;
+	my $humanreadable 	= Number::Bytes::Human->new(bs => 1000, si => 1);
+
+	my $hashsize 	= @keys;
+	my $bytesread 	= 0;
+
+
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		if( $tsmobject{ $counter }{ 'SUCCESSFUL' } eq 'NO' ) {
+			$status 		= 'Missed';
+			$statusmessage 	= "$yesterday backup was not succesful; no bytes read";
+			last;
+		}
+
+		$bytesread += $tsmobject{ $counter }{ 'BYTES' };
+	}
+
+	$bytesread < 0 and do {
+		$n->nagios_exit( CRITICAL, (caller(0))[3].": read negative bytes: $bytesread" );
+	};
+
+	# called from the command-line
+	if( ! @_ ) {
+		$tsmobject{ '0' }{ 'SUCCESSFUL' } eq "YES" and do {
+			$status = 'Completed';
+			$statusmessage = "Total backup size: ".$humanreadable->format( $bytesread );
+		};
+
+		$n->add_perfdata( label =>'Backup Size', value => sprintf( "%.2f", $bytesread / ( 1024 * 1024 * 1024 ) ), uom => 'gB');
+
+		return $n->nagios_exit( $nightlystate{ $status } , $statusmessage );
+	}
+
+	return $bytesread ;  #human readable format
+}
+
+sub get_missedfiles {
+
+	my %missedfilestate = (
+		Completed	=> 'OK',
+		Missed 		=> 'WARNING',
+		Other	  	=> 'CRITICAL',
+		Uknown 		=> 'UNKNOWN',
+	);
+	
+	my $status 			= '';
+	my $statusmessage 	= '';
+
+	my $yesterday = DateTime->now->subtract( days =>  1 )->ymd;
+
+	my $nightlyquery  = "select * from activity_summary where ".
+		"entity='".uc( $node )."' and activity='BACKUP' and start_time>\'$yesterday\'";
+
+	my %nightlyresult = dsmadmc( $nightlyquery );
+
+	if( $nightlyresult{ '0' }{ 'FAILED' } >  0 ) {
+		$status 		= 'Missed';
+		$statusmessage  = "MISSED: $nightlyresult{ '0' }{ 'FAILED' } files during last night's backup";
+	}
+	elsif( $nightlyresult{ '0' }{ 'FAILED' } == 0 ) {
+		$status 		= 'Completed';
+		$statusmessage 	= "No files missed";
+	}
+	else {
+		$status 		= 'Uknown';
+		$statusmessage 	= (caller(0))[3].": Unspecified message returned/number of files ".
+							"negative: \$nightlyresult\{\'FAILED\'\}: $nightlyresult{ '0' }{ 'FAILED' }";
+	}
+
+	$n->add_perfdata( label => 'Missed files', value => int( $nightlyresult{ '0' }{ 'FAILED' } ), uom => '' );
+
+	return $missedfilestate{ $status }, $statusmessage;
+}
+
+sub get_expiredfiles {
+
+	my %expiredfilesstate = (
+		NoExpiration => 'OK',
+		Expired		 => 'WARNING',
+		Other	  	 => 'CRITICAL',
+		Uknown 		 => 'UNKNOWN',
+	);
+	
+	my $status 			= '';
+	my $statusmessage 	= '';
+
+	my $yesterday = DateTime->now->subtract( days =>  1 )->ymd;
+
+	my $expiredfilesquery  = "select * from activity_summary where ".
+		"entity='".uc( $node )."' and activity='EXPIRATION' and start_time>'".$yesterday."'";
+
+
+	my %expiredfilesresult = dsmadmc( $expiredfilesquery );
+
+	if( $expiredfilesresult{ '0' }{ 'NUMBER' } >  0 ) {
+		$status 		= 'Expired';
+		$statusmessage  = "EXPIRED: $expiredfilesresult{ '0' }{ 'NUMBER' } files during ".$yesterday." backup";
+	}
+	elsif( $expiredfilesresult{ '0' }{ 'FAILED' } == 0 ) {
+		$status 		= 'NoExpiration';
+		$statusmessage  = "No files expired";
+	}
+	else {
+		$status 		= 'Uknown' ;
+		$statusmessage  = (caller(0))[3].": Unknown result";
+	}
+	
+	$n->add_perfdata( label => 'Expired files', value => int( $expiredfilesresult{ '0' }{ 'NUMBER' } ), uom => '' );
+
+	return $expiredfilesstate{ $status }, $statusmessage;
+
+}
+
+sub get_drivestatus {
+
+	my %drivestate = (
+		YES			=> 'OK',
+		NO 			=> 'CRITICAL',
+		Uknown 		=> 'UNKNOWN',
+	);
+	
+	my $status 			= 'YES';
+	my $statusmessage 	= '';
+
+
+	my $drivestatusquery  = "select * from drives";
+	my %drivestatusresult = dsmadmc( $drivestatusquery );
+
+	my @keys 		= keys %drivestatusresult;
+	my $hashsize 	= @keys;
+
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		if( $drivestatusresult{$counter}{ 'ONLINE' } eq 'NO' ) {
+			$status 		 = 'NO';
+			$n->add_perfdata( 	label 	=> $drivestatusresult{ $counter }{ 'LIBRARY_NAME' }.": ".$drivestatusresult{ $counter }{ 'DRIVE_NAME' },
+								value 	=> 0,
+								uom 	=> '',
+								min 	=> 0,
+								max 	=> 1
+							);
+		}
+		elsif( $drivestatusresult{$counter}{ 'ONLINE' } eq 'YES' ) {
+			$n->add_perfdata( 	label 	=> $drivestatusresult{ $counter }{ 'LIBRARY_NAME' }.": ".$drivestatusresult{ $counter }{ 'DRIVE_NAME' },
+								value 	=> 1,
+								uom 	=> '',
+								min 	=> 0,
+								max 	=> 1
+							);
+		}
+		else {
+			# no-man's land
+			$n->nagios_die( (caller(0))[3].": Unknown result" );
+		}
+
+		$statusmessage .= "Library $drivestatusresult{ $counter }{ 'LIBRARY_NAME' }: drive ".
+							"$drivestatusresult{ $counter }{ 'DRIVE_NAME' }: Online: ".
+							"$drivestatusresult{ $counter }{ 'ONLINE' } ";
+		
+		if( $counter ne ($hashsize - 1) ) { $statusmessage .= "  "; };
+
+		$counter++;
+	}
+
+
+
+	if( $status eq "NO" ) { $statusmessage .= " Notify Research Computing!"; }
+
+	return $drivestate{ $status }, $statusmessage;
+
+}
+
+sub get_freespace {
+
+	# ensure that warning and critical are set
+	if( ! $n->opts->warning || ! $n->opts->critical ) {
+		$n->nagios_exit( CRITICAL, "warning or critical percentage are not set for the test");
+	}
+
+	# Estimated Capacity
+	#         The estimated capacity of the volume, in megabytes (M),
+	#         gigabytes (G), or terabytes (T).
+	#         For DISK devices, this value is the capacity of the volume.
+	#
+	#         For sequential access devices, this value is an estimate of the
+	#         total space available on the volume, based on the device class.
+	
+	my $status 			= '';
+	my $statusmessage 	= '';
+	my $humanreadable 	= Number::Bytes::Human->new(bs => 1000, si => 1);
+
+	# TP ::= 'tape pool' # FP ::= 'file pool', usually disk
+	my $freetapepoolquery  = "select * from stgpools where stgpool_name='VISLAB_TP' or stgpool_name='VISLAB_FP'";
+
+	my %freetapepoolresult = dsmadmc( $freetapepoolquery );
+
+	my @keys 			= keys %freetapepoolresult; 
+	my $hashsize 		= @keys;
+
+	my $filepoolresult 	= 0; my $filepoolmessage = "";
+	my $tapepoolresult  = 0; my $tapepoolmessage = "";
+
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		if( $freetapepoolresult{ $counter }{ 'STGPOOL_NAME' } eq 'VISLAB_FP' ) {
+
+			$filepoolresult = $freetapepoolresult{ $counter }{ 'PCT_UTILIZED' };
+			$filepoolmessage .= "File pool: ".$freetapepoolresult{ $counter }{ 'PCT_UTILIZED' }."% used, ".
+										$humanreadable->format(
+											$freetapepoolresult{ $counter }{ 'EST_CAPACITY_MB' } * 1024 * 1024 
+										).
+										" total ";
+
+			$n->add_perfdata(
+					label 	=> 'File pool: % utilization',
+					value 	=> $freetapepoolresult{ $counter }{ 'PCT_UTILIZED' },
+					uom		=> '%'
+				);
+			$n->add_perfdata(
+					label 	=> "File pool: GB utilized",
+					value 	=> sprintf( "%.2f",
+									( ( $freetapepoolresult{ $counter }{ 'EST_CAPACITY_MB' } / ( 1024 * 1024 ) ) *
+										$freetapepoolresult{ $counter }{ 'PCT_UTILIZED' }
+									)
+								),
+					uom 	=> 'GB',
+					max 	=> int( $freetapepoolresult{ $counter }{ 'EST_CAPACITY_MB' } / 1024 )
+				);
+		}
+
+		if( $freetapepoolresult{ $counter }{ 'STGPOOL_NAME' } eq 'VISLAB_TP' ) {
+
+			$tapepoolresult = $freetapepoolresult{ $counter }{ 'PCT_UTILIZED' };
+			$tapepoolmessage .= "Tape pool: ".$freetapepoolresult{ $counter }{ 'PCT_UTILIZED' }."% used, ".
+										$humanreadable->format(
+											$freetapepoolresult{ $counter }{ 'EST_CAPACITY_MB' } * 1024 * 1024 
+										).
+										" total ";
+			$n->add_perfdata(
+					label 	=> 'Tape pool: % utilization',
+					value 	=> $freetapepoolresult{ $counter }{ 'PCT_UTILIZED' },
+					uom		=> '%'
+				);
+			$n->add_perfdata(
+					label 	=> "Tape pool: GB utilized",
+					value 	=> sprintf( "%.2f",
+									( ( $freetapepoolresult{ $counter }{ 'EST_CAPACITY_MB' } / ( 1024 * 1024 ) ) *
+										$freetapepoolresult{ $counter }{ 'PCT_UTILIZED' }
+									)
+								),
+					uom 	=> 'GB',
+					max 	=> int( $freetapepoolresult{ $counter }{ 'EST_CAPACITY_MB' } / 1024 )
+				);
+		}
+	}
+
+	$n->set_thresholds( warning => $n->opts->warning, critical => $n->opts->critical );
+	$statusmessage = $tapepoolmessage.$filepoolmessage;
+	
+	# called from the command-line
+	if( ! @_ ) {
+		return $n->nagios_exit(
+						return_code => $n->check_threshold ( $tapepoolresult ),
+						message     => $statusmessage
+					);
+	}
+
+	return $n->check_threshold ( $tapepoolresult ), $statusmessage;
+}
+
+sub tapesro {
+
+	# ensure that warning and critical are set
+	if( ! $n->opts->warning || ! $n->opts->critical ) {
+		$n->nagios_exit( CRITICAL, "warning or critical percentage are not set for the test");
+	}
+
+	my $status 			= '';
+	my $statusmessage 	= '';
+
+	my $tapesroquery  = "select * from volumes where error_state='YES'";
+
+	my %tapesroresult = dsmadmc( $tapesroquery );
+
+
+	my @keys 				= keys %tapesroresult;
+	my $readonlytapecounter = @keys;
+	my $mytapesinfo			= '';
+
+	for my $counter ( 0..($readonlytapecounter - 1) ) {
+		if( $tapesroresult{ $counter }{ 'ERROR_STATE' } eq 'YES' ) { ;
+
+			$mytapesinfo .= $tapesroresult{ $counter }{ 'VOLUME_NAME' }." ";
+		}
+		
+		$counter++;
+	}
+
+	if( ! %tapesroresult ){
+		# no problems
+		$statusmessage = "No tapes are R/O";
+	}
+	elsif( $readonlytapecounter > 0 and $readonlytapecounter < $n->opts->critical) {
+		# warning
+		$statusmessage = $readonlytapecounter." tapes are in R/O status: ".$statusmessage;
+	}
+	elsif( $readonlytapecounter >= $n->opts->critical ) {
+		#critical
+		$statusmessage = $readonlytapecounter." tapes are in R/O status!!!!";
+	}
+	else {
+		# negative numbers
+		$statusmessage = (caller(0))[3].": Something has gone negatively wrong";
+	}
+
+	$statusmessage .= $mytapesinfo;
+
+	$n->set_thresholds( warning => $n->opts->warning, critical => $n->opts->critical );
+
+	
+	# add perfomance data:
+	# 	how many readonly tapes
+	$n->add_perfdata( 	label 	=> "R/O Tapes",
+						value 	=> int( $readonlytapecounter ),
+						uom 	=> '',
+						#threshold 	=> $n->warning;
+					);
+
+	# called from the command-line
+	if( ! @_ ) {
+		return $n->nagios_exit(
+						return_code => $n->check_threshold ( $readonlytapecounter ),
+						message     => $statusmessage
+					);
+	}
+
+	return $n->check_threshold ( $readonlytapecounter ), $statusmessage;
+
+}
+
+sub tapeset {
+
+	# ensure that warning and critical are set
+	if( ! $n->opts->warning || ! $n->opts->critical ) {
+		$n->nagios_exit( CRITICAL, "warning or critical percentage are not set for the test");
+	}
+
+	# if anybody has an idea on how to minimize the amount of times spent
+	# in the queries, holler
+
+	my $status 			= '';
+	my $statusmessage 	= '';
+
+	my $yesterday = DateTime->now->subtract( days =>  1 )->ymd;
+
+	my $tapesetquery  			= "select volume_name from libvolumes order by volume_name ";
+	my $tapeemptyquery 			= "select volume_name from libvolumes where last_use is null and status='Scratch' order by volume_name";
+	my $tapeoccupancyquery 		= "select volume_name from libvolumes where status='Private' order by volume_name ";
+	my $tapesdata 				= "select volume_name from libvolumes where status='Private' and last_use='Data' order by volume_name";
+	my $tapetsmdbbackupquery	= "select volume_name from libvolumes where status='Private' and last_use='DbBackup' order by volume_name";
+
+	my $vislaboccupiedtapesquery =
+			"select volumes.volume_name from ".
+				"volumes,libvolumes where ".
+				"volumes.stgpool_name='VISLAB_TP' and ".
+				"volumes.volume_name=libvolumes.volume_name and ".
+				"volumes.error_state='NO' order by volumes.volume_name "; # last one is purely for insurance
+
+	# ugly
+
+	my %tapesetresult 			= dsmadmc( $tapesetquery );
+	my %tapeemptyresult 		= dsmadmc( $tapeemptyquery );
+	my %tapeoccupancyresult 	= dsmadmc( $tapeoccupancyquery );
+	my %tapetsmdbbackupresult 	= dsmadmc( $tapetsmdbbackupquery );
+
+	my %vislaboccupiedtapesresult = dsmadmc( $vislaboccupiedtapesquery );
+
+	my @tapesetresult_keys				= keys %tapesetresult;
+	my $tapesetresult_hashsize 			= @tapesetresult_keys;
+	my @tapeemptyresult_keys 			= keys %tapeemptyresult;
+	my $tapeemptyresult_hashsize 		= @tapeemptyresult_keys;
+	my @tapeoccupancyresult_keys 		= keys %tapeoccupancyresult;
+	my $tapeoccupancyresult_hashsize 	= @tapeoccupancyresult_keys;
+	my @tapetsmdbbackupresult_keys 		= keys %tapetsmdbbackupresult;
+	my $tapetsmdbbackupresult_hashsize 	= @tapetsmdbbackupresult_keys;
+
+	my @vislaboccupiedtapesresult_keys  	= keys %vislaboccupiedtapesresult;
+	my $vislaboccupiedtapesresult_hashsize 	= @vislaboccupiedtapesresult_keys;
+
+
+	$n->set_thresholds( warning => $n->opts->warning, critical => $n->opts->critical );
+
+	my $tapesother_size = $tapesetresult_hashsize -
+							$tapeemptyresult_hashsize -
+							$tapetsmdbbackupresult_hashsize -
+							$vislaboccupiedtapesresult_hashsize;
+
+	$statusmessage = $tapesetresult_hashsize." total tapes, ".
+						$vislaboccupiedtapesresult_hashsize." used by lab, ".
+						$tapeemptyresult_hashsize." empty, ".
+						$tapetsmdbbackupresult_hashsize." used by TSM db, ".
+						$tapesother_size." by others (".
+						$tapeoccupancyresult_hashsize." total private tapes)";
+
+	# add perf data
+	my %tapeperfdata = (
+							totaltapes 	=> $tapesetresult_hashsize,
+							vislabtapes => $vislaboccupiedtapesresult_hashsize,
+							emptytapes 	=> $tapeemptyresult_hashsize,
+							tsmdbtapes 	=> $tapetsmdbbackupresult_hashsize,
+							tapesother 	=> $tapesother_size,
+							totalprivatetapes => $tapeoccupancyresult_hashsize
+						);
+
+	add_tapeset_perfdata( %tapeperfdata );
+
+	# called from the command-line
+	if( ! @_ ) {
+		return $n->nagios_exit(
+						return_code => $n->check_threshold ( $vislaboccupiedtapesresult_hashsize ),
+						message     => $statusmessage
+					);
+	}
+
+	return $n->check_threshold ( $vislaboccupiedtapesresult_hashsize ), $statusmessage;
+}
+
+sub add_tapeset_perfdata {
+
+	my %tapeperfdata 	= @_ ;
+	my @key 			= keys %tapeperfdata;
+
+	foreach( @key ) {
+
+		if( $_ eq 'vislabtapes' ) {
+			$n->add_perfdata(
+								label 	=> "$_",
+								value 	=> int( $tapeperfdata{ $_ } ),
+								uom 	=> '',
+								warning => $n->opts->warning,
+								critical => $n->opts->critical
+							);
+		}
+		elsif( $_ eq '' ) {
+			$n->nagios_exit( WARNING, ((caller(0))[3].": \$_ was null") );
+		}
+		else {
+				$n->add_perfdata(
+									label 	=> "$_",
+									value 	=> int( $tapeperfdata{ $_ } ),
+									uom 	=> ''
+								)
+		}
+	}
+
+}
+
+sub get_lastbackup {
+
+	# ensure that warning and critical are set
+	if( ! $n->opts->warning || ! $n->opts->critical ) {
+		$n->nagios_exit( CRITICAL, "warning or critical percentage are not set for the test");
+	}
+	
+	my $statusmessage 	= '';
+	my $yesterday = DateTime->now->subtract( days =>  1 );
+	my $lastbackupquery = "select start_time from activity_summary where entity='".uc( $node ).
+							"' and activity='BACKUP' and successful='YES' order by start_time desc";
+
+	my %tsmobject 	= dsmadmc( $lastbackupquery );
+	# we need to compare the '0' element in the hash against
+	# 	yesterday's date
+
+	my $lastbackupdate_string = $tsmobject{ '0' }{ 'START_TIME' };
+	$lastbackupdate_string    =~ s/\.0{6}$//;
+
+	my $strp  			= DateTime::Format::Strptime->new( pattern   => '%Y-%m-%d %T' );
+	my $lastbackupdate 	= $strp->parse_datetime( $lastbackupdate_string );
+
+	my $duration 		= $lastbackupdate->delta_days( $yesterday );
+
+	if( abs( $duration->days ) == 0 ) {
+		$statusmessage = "Backup dates do not differ";
+	}
+	elsif( abs( $duration->days ) > $n->opts->warning  ) {
+		$statusmessage = "Backup has not run for one day";
+	}
+	elsif( abs( $duration->days ) > $n->opts->critical ) {
+		$statusmessage = "Backup has not run for ".$duration->days."!!!!"
+	}
+	else {
+		$statusmessage = ((caller(0))[3])." You've just crossed over into the Twilight Zone.";
+	}
+
+	$n->set_thresholds( warning => $n->opts->warning, critical => $n->opts->critical );
+	$n->add_perfdata( label => 'Days backup has not run', value => int( $duration->days ), uom => '',
+						warning => $n->opts->warning, critical => $n->opts->critical 
+					);
+	
+	# called from the command-line
+	if( ! @_ ) {
+		return $n->nagios_exit(
+						return_code => $n->check_threshold( $duration->days ),
+						message     => $statusmessage
+					);
+	}
+
+	return  $n->check_threshold( $duration->days ), $statusmessage;
+}
+
+#
+# determine the duration of a backup
+sub get_backupduration {
+
+	my %backupstatus = (
+		Completed	=> 'OK',
+		Running		=> 'WARNING',
+		Other	  	=> 'CRITICAL',
+		Uknown 		=> 'UNKNOWN',
+	);
+
+	my $status 			= '';
+	my $statusmessage 	= '';
+
+	my $yesterday = DateTime->now->subtract( days =>  1 )->ymd;
+
+	my $nightlyquery  = "select * from activity_summary where ".
+		"entity='".uc( $node )."' and activity='BACKUP' and start_time>\'$yesterday\'";
+
+
+	my %tsmobject 	= @_ ? @_ : dsmadmc( $nightlyquery );
+	my $starttime  	= $tsmobject{ '0' }{ 'START_TIME' };
+	my $endtime 	= $tsmobject{ '0' }{ 'END_TIME' };
+
+	$starttime  	=~ s/\.0{6}$//;
+	$endtime 		=~ s/\.0{6}$//;
+	
+	# %F == ISO, ie %Y-%m-%d , %T == %H:%M:%S, %4N nanoseconds, with 6 digit accuracy.
+	my $beginbackup	= Time::Piece->strptime( $starttime, '%F %T' );
+	my $endbackup 	= Time::Piece->strptime( $endtime,   '%F %T' );
+	
+	my $duration 	= $endbackup - $beginbackup;
+	
+	my $formatedduration  = $duration->hours ? sprintf( "%.2fh", $duration->hours ) : "";
+
+	if( $tsmobject{ '0' }{ 'SUCCESSFUL' } eq "YES" ) {
+		$status 		= "Completed";
+		$statusmessage 	= "Backup duration ".$formatedduration;
+	}
+	elsif( $tsmobject{ '0' }{ 'SUCCESSFUL' } ne "YES" ) {
+		$status 		= "Other";
+		$statusmessage 	= "Backup not completed";
+	}
+
+	# called from the command-line
+	if( ! @_ ) {
+
+		$n->add_perfdata(
+							label 		=> 'Backup duration (in hours)',
+							value 		=>  sprintf( "%.2f", $duration->hours ),
+							uom 		=> '',
+							warning 	=> 6, #hardcoded, yes
+							critical 	=> 12,
+							min 		=> 1,
+							max 		=> 72 # three days
+						);
+		return $n->nagios_exit( $backupstatus{ $status }, $statusmessage );
+	}
+
+	return $duration->hours;
+}
+
+sub queryvolumes {
+
+	my $volumesquery  	= "select volumes.volume_name, volumes.est_capacity_mb, volumes.pct_utilized from volumes,libvolumes where ".
+							"libvolumes.volume_name=volumes.volume_name and ".
+							"( stgpool_name='VISLAB_FP' or stgpool_name='VISLAB_TP') order by volumes.volume_name ";
+
+	my %queryvolumesresult 	= @_ ? @_ : dsmadmc( $volumesquery );
+	my @keys 				= keys %queryvolumesresult;
+	my $hashsize 			= @keys;
+	my $label 				= '';
+	my $value 				= 0;
+	my $max 				= 0;
+	my $uom					= 'GB';
+	
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		$label	= $queryvolumesresult{ $counter }{ 'VOLUME_NAME' };
+		$value 	= ( $queryvolumesresult{ $counter }{ 'EST_CAPACITY_MB' } * ( $queryvolumesresult{ $counter }{ 'PCT_UTILIZED' } / 100 ) ) /
+					( 1024 ); #in GB
+		$max 	= $queryvolumesresult{ $counter }{ 'EST_CAPACITY_MB' } / 1024 ; # in GB
+
+		$n->add_perfdata( label => $label, value => sprintf( "%.2f", $value ), uom => $uom, max => sprintf( "%.2f", $max ) );
+
+		$counter++;
+	}
+
+	return "OK", "Tracking perfdata, no actual check";
+
+}
+
+sub queryvolumeswriteerrors {
+
+	my $volumesquery  	= "select volumes.volume_name, volumes.write_errors from volumes,libvolumes where ".
+							"libvolumes.volume_name=volumes.volume_name and ".
+							"( stgpool_name='VISLAB_FP' or stgpool_name='VISLAB_TP' ) order by volumes.volume_name ";
+
+	my %queryvolumesresult 	= @_ ? @_ : dsmadmc( $volumesquery );
+	my @keys 				= keys %queryvolumesresult;
+	my $hashsize 			= @keys;
+	my $label 				= '';
+	my $value 				= 0;
+	my $max 				= 0;
+	my $uom					= '';
+	
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		$label = $queryvolumesresult{ $counter }{ 'VOLUME_NAME' };
+		$value = $queryvolumesresult{ $counter }{ 'WRITE_ERRORS' };
+
+		$n->add_perfdata( label => $label, value => int( $value ), uom => $uom );
+
+		$counter++;
+	}
+
+	return "OK", "Perfdata: volume write errors, no actual check";
+}
+
+sub queryvolumesreaderrors {
+
+	my $volumesquery  	= "select volumes.volume_name, volumes.read_errors from volumes,libvolumes where ".
+							"libvolumes.volume_name=volumes.volume_name and ".
+							"( stgpool_name='VISLAB_FP' or stgpool_name='VISLAB_TP' ) order by volumes.volume_name ";
+
+	my %queryvolumesresult 	= @_ ? @_ : dsmadmc( $volumesquery );
+	my @keys 				= keys %queryvolumesresult;
+	my $hashsize 			= @keys;
+	my $label 				= '';
+	my $value 				= 0;
+	my $max 				= 0;
+	my $uom					= '';
+	
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		$label = $queryvolumesresult{ $counter }{ 'VOLUME_NAME' };
+		$value = $queryvolumesresult{ $counter }{ 'READ_ERRORS' };
+
+		$n->add_perfdata( label => $label, value => int( $value ), uom => $uom );
+
+		$counter++;
+	}
+
+	return "OK", "Perfdata: volume read errors, no actual check";
+}
+
+
+sub allexportedfilesystemsbackedup {
+
+	my %filesystemstatus = (
+		same		=> 'OK',
+		different	=> 'CRITICAL',
+		other	  	=> 'CRITICAL',
+		uknown 		=> 'UNKNOWN',
+	);
+
+	my $status 			= '';
+	my $statusmessage 	= '';
+
+	my @output 		= ( );
+
+	my @exported_filesystems = get_exportedfilesystems( );
+	my @backedup_filesystems = get_backedupfilesystems( );
+
+	if( ! @backedup_filesystems ) { 
+		$n->nagios_die( ((caller(0))[3]).": No exported filestems returned!" ); 
+	}
+
+	@exported_filesystems = sort @exported_filesystems;
+	@backedup_filesystems = sort @backedup_filesystems;
+
+	my $exported_size = @exported_filesystems;
+	my $backedup_size = @backedup_filesystems;
+
+	if( @exported_filesystems ~~ @backedup_filesystems ) {
+		$status = 'same';
+		$statusmessage = 'No difference in filesystems exported/backedup';
+	}
+	elsif( @exported_filesystems > @backedup_filesystems ) {
+		$status = 'different';
+		$statusmessage = 'More exported filesystems than backed up.';
+	}
+	elsif( @exported_filesystems < @backedup_filesystems ) {
+		$status = 'different';
+		$statusmessage = 'Less exported filesystems than backed up.';
+	}
+	else {
+		$n->nagios_die( ((caller(0))[3]).": Twilight zone" );
+	}
+
+	$n->add_perfdata( label => 'filesystems exported', value => $exported_size, uom => '' );
+	$n->add_perfdata( label => 'filesystems backed up', value => $backedup_size, uom => '' );
+
+
+	return $filesystemstatus{ $status }, $statusmessage;
+
+}
+
+sub get_exportedfilesystems {
+
+	my @fillers 				= ( 'fas6280-a.vis.kaust.edu.sa', 'fas6280-b.vis.kaust.edu.sa' ) ;
+	my @exported_filesystems 	= ( );
+	my $showmount 				= '/usr/sbin/showmount';
+
+	foreach my $filler ( @fillers ) {
+
+		my @args = ( '-e', $filler );
+		open( my $showmount_handle , '-|', $showmount, @args );
+		
+		my @exports = <$showmount_handle>;
+		close( $showmount_handle );
+
+		foreach( @exports ) {
+
+			( 	/vol0/ or /db-0\d/ 	or /mail-0\d/ or /iscsi/ or
+				/office_backup/ 	or /images_windows/ 	or
+				/bbp_00_data/    	or /scratch/ 			or
+				/backup/ 			or /services/ ) and next;
+
+			( $filler eq 'fas6280-a.vis.kaust.edu.sa' and $_ eq '/vol/production' )  and next;
+
+				my $path = '';
+				/^\/vol/ and do {
+
+				( $path, ) = split;
+				chomp $path;
+
+				$path !~ /^\//  and $path = '/'.$path;
+				my $absolutepath =  "/network/".$filler.$path;
+				$absolutepath eq "/network/fas6280-a.vis.kaust.edu.sa/vol/production" and next;
+
+				if( -e $absolutepath ) {
+					push @exported_filesystems, $absolutepath;
+				}
+				else {
+					my $hostname = Sys::Hostname::FQDN::fqdn();
+					$n->nagios_die( ((caller(0))[3]).": Absolute path '".$absolutepath."' does not exist on host '".$hostname."'"); 
+				}
+			}
+
+		}
+	
+	# # end foreach
+	}
+
+	return @exported_filesystems;
+}
+
+sub get_backedupfilesystems {
+
+	my $backedupfilesystems_query 		= "select filespace_name from filespaces where node_name='".$node."'";
+	my %backedupfilesystems_results 	= dsmadmc( $backedupfilesystems_query );
+	my @backedup_filesystems		 	= ( );
+
+
+	my @keys 		= keys %backedupfilesystems_results;
+	my $hashsize 	= @keys;
+
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		$backedupfilesystems_results{ $counter }{ 'FILESPACE_NAME' } =~ /^\/network/ and do {
+			$backedupfilesystems_results{ $counter }{ 'FILESPACE_NAME' } =~ /office_backup/ and next;
+			$backedupfilesystems_results{ $counter }{ 'FILESPACE_NAME' } =~ /scratch/ and next;
+
+			push @backedup_filesystems, $backedupfilesystems_results{ $counter }{ 'FILESPACE_NAME'};
+		};
+		$counter++;
+	}
+
+	return @backedup_filesystems;
+}
+
+sub get_dblogsize {
+
+	# ensure that warning and critical are set
+	if( ! $n->opts->warning || ! $n->opts->critical ) {
+		$n->nagios_exit( CRITICAL, "warning or critical percentage are not set for the test");
+	}
+
+	my $statusmessage 	= '';
+
+	my $dblogsizequery 	= "select * from log";
+	my %dblogsizeresult = dsmadmc( $dblogsizequery );
+
+	my $total_log_space	= 0;
+	my $used_log_space 	= 0;
+	my $free_log_space 	= 0;
+	my $used_percent 	= 0.0;
+
+	my @keys 		= keys %dblogsizeresult;
+	my $hashsize 	= @keys;
+
+	#die Dumper( %dblogsizeresult );
+
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		$total_log_space 	= $dblogsizeresult{ $counter }{ 'TOTAL_SPACE_MB' };
+		$used_log_space 	= $dblogsizeresult{ $counter }{ 'USED_SPACE_MB' };
+		$free_log_space 	= $dblogsizeresult{ $counter }{ 'FREE_SPACE_MB' };
+
+		my $total_log_space_b	= $dblogsizeresult{ $counter }{ 'TOTAL_SPACE_MB' } * 1024 * 1024;
+		my $used_log_space_b 	= $dblogsizeresult{ $counter }{ 'USED_SPACE_MB' } * 1024 * 1024;
+		
+		$used_percent = $used_log_space_b / $total_log_space_b * 100;
+
+		my $warning 	= int( $total_log_space * ( $n->opts->warning  / 100 ) * 100 ) ;
+		my $critical 	= int( $total_log_space * ( $n->opts->critical / 100 ) * 100 ) ;
+		$n->set_thresholds( warning => $warning, critical => $critical );
+
+		$total_log_space 	/= 1024;
+		$used_log_space 	/= 1024;
+		$free_log_space 	/= 1024;
+
+		$statusmessage   .= sprintf( "Total log size ( %.2fGB ), %.2f%% utilized - %.2fGB used, %.2fGB free ",
+								$total_log_space, $used_percent, $used_log_space, $free_log_space
+		);
+
+		$n->add_perfdata( label => "Total log space", value => sprintf( "%.2f", $total_log_space ), uom => "GB" );
+		$n->add_perfdata( label => "Used log space",  value => sprintf( "%.2f", $used_log_space  ), uom => "GB", min => 0, max => sprintf( "%.2f", $total_log_space ) );
+		$n->add_perfdata( label => "Free logspace",   value => sprintf( "%.2f", $free_log_space  ), uom => "GB" );
+		
+		$counter++
+	}
+	
+	return $n->check_threshold( int( $used_percent ) ), $statusmessage ;
+}
+
+sub get_dbsize { 
+
+	# ensure that warning and critical are set
+	if( ! $n->opts->warning || ! $n->opts->critical ) {
+		$n->nagios_exit( CRITICAL, "warning or critical percentage are not set for the test");
+	}
+
+	my $statusmessage 	= '';
+
+	my $dbsizequery 	= "select * from db";
+	my %dbsizeresult 	= dsmadmc( $dbsizequery );
+
+	my $database_name 		= '';
+	my $total_file_system	= 0;
+	my $used_db_space 		= 0;
+	my $free_db_space		= 0;
+	my $used_percent		= 0.0;
+	
+	my @keys 		= keys %dbsizeresult;
+	my $hashsize 	= @keys;
+
+	for my $counter ( 0..($hashsize - 1) ) {
+		
+		$database_name 		= $dbsizeresult{ $counter }{ 'DATABASE_NAME' };
+		$total_file_system 	= $dbsizeresult{ $counter }{ 'TOT_FILE_SYSTEM_MB' };
+		$used_db_space 		= $dbsizeresult{ $counter }{ 'USED_DB_SPACE_MB' };
+		$free_db_space 		= $dbsizeresult{ $counter }{ 'FREE_SPACE_MB' };
+
+		my $total_file_system_b	= $dbsizeresult{ $counter }{ 'TOT_FILE_SYSTEM_MB' } * 1024 * 1024;
+		my $used_db_space_b 	= $dbsizeresult{ $counter }{ 'USED_DB_SPACE_MB' } * 1024 * 1024;
+		my $free_space_b 		= $dbsizeresult{ $counter }{ 'FREE_SPACE_MB' } * 1024 * 1024;
+
+		my $warning 	= int( $total_file_system * ( $n->opts->warning  / 100 ) * 100 ) ;
+		my $critical 	= int( $total_file_system * ( $n->opts->critical / 100 ) * 100 ) ;
+	
+		$n->set_thresholds( warning => $warning, critical => $critical );
+		
+
+		$total_file_system 	/= 1024;
+		$used_db_space 		/= 1024;
+		$free_db_space 		/= 1024;
+
+		$used_percent = $used_db_space_b / $total_file_system_b * 100 ;
+
+		$statusmessage   .= sprintf(
+					"Database '%s': ".
+					"Total filesystem size ( %.2fGB ), %.2f%% utilized - %.2fGB used, %.2fGB free ",
+					$database_name, $total_file_system, $used_percent, $used_db_space, $free_db_space
+		);
+
+		$n->add_perfdata( label => $database_name.": total db space", value => sprintf( "%.2f", $total_file_system), uom => "GB" );
+		$n->add_perfdata( label => $database_name.": used  db space", value => sprintf( "%.2f", $used_db_space), 	 uom => "GB", min => 0, max => sprintf( "%.2f", $total_file_system) );
+		$n->add_perfdata( label => $database_name.": free  db space", value => sprintf( "%.2f", $free_db_space ),  	 uom => "GB" );
+
+		$counter++;
+	}
+
+	return $n->check_threshold( int( $used_percent ) ), $statusmessage ;
+}
+
+sub get_filespaces {
+
+	my $filespaces_query = 
+	"select filespaces.node_name, filespaces.filespace_name, filespaces.capacity, filespaces.pct_util, occupancy.num_files from ".
+				"filespaces,occupancy ".
+				"where filespaces.filespace_name=occupancy.filespace_name and ".
+				"filespaces.node_name='".uc( $node ).
+				"' and ( filespaces.filespace_name <> '/' and filespaces.filespace_name not like '/home%' ) ".
+				"order by filespaces.filespace_name";
+	my %filespace_result = dsmadmc( $filespaces_query );
+
+	my @keys 		= keys %filespace_result;
+	my $hashsize 	= @keys;
+
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		my $label 			= $filespace_result{ $counter }{ 'FILESPACE_NAME' };
+		my $total_value 	= sprintf( "%.2f", $filespace_result{ $counter }{ 'CAPACITY' } / 1024 ) ;
+		my $used 			= sprintf( "%.2s", $filespace_result{ $counter }{ 'CAPACITY' } * $filespace_result{ $counter }{ 'PCT_UTIL' } );
+		my $numberoffiles 	= $filespace_result{ $counter }{ 'NUM_FILES' };
+		my $max 			= $filespace_result{ $counter }{ 'CAPACITY' };
+		my $pct_utilized 	= $filespace_result{ $counter }{ 'PCT_UTIL' };
+
+		$n->add_perfdata( label => $label.": number of files", value => $numberoffiles, uom => '');
+		$n->add_perfdata( label => $label.": percent utilized", value => $pct_utilized, uom => '%', min => 0, max => 100 ); # lol
+		$n->add_perfdata( label => $label." total", value => $total_value, uom => 'GB', max => $max );
+		$n->add_perfdata( label => $label." used",  value => $used,  	   uom => 'GB', max => $max );
+
+		$counter++;
+	}
+
+	return 'OK', "Perfdata: filespace sizes, no actual check" ;
+}
+
+sub get_scratch {
+
+	# ensure that warning and critical are set
+	if( ! $n->opts->warning || ! $n->opts->critical ) {
+		$n->nagios_exit( CRITICAL, "warning or critical percentage are not set for the test");
+	}
+
+	my %scratchstatus = (
+		alot		=> 'OK',
+		shortage	=> 'WARNING',
+		eatingtapes	=> 'CRITICAL',
+		uknown 		=> 'UNKNOWN',
+	);
+
+
+	my $status 			= '';
+	my $statusmessage 	= '';
+
+
+	my $scratchquery 	= "select volume_name from libvolumes where last_use is null and status='Scratch'";
+	my %scratch_result 	= dsmadmc( $scratchquery );
+	my @scratch_keys	= keys %scratch_result;
+	my $scratchsize 	= @scratch_keys;
+
+	my $totaltapesquery = "select maxscratch from stgpools where stgpool_name='VISLAB_TP' ";
+	my %totalapesresult = dsmadmc( $totaltapesquery );
+	my $min 			= 0;
+	my $max 			= $totalapesresult{ '0' }{ 'MAXSCRATCH'};
+
+
+	# setting warnings and checking against threshold
+	# is not going to work with this one
+	# because start <= end, contrary to nagios plugin guidelines
+
+	if( $scratchsize < $n->opts->critical ) {
+		# panic
+		$status = 'eatingtapes';
+	}
+	elsif( $scratchsize < $n->opts->warning and $scratchsize >= $n->opts->critical ) {
+		# warning
+		$status = 'shortage';
+	}
+	elsif( $scratchsize >= $n->opts->warning ) {
+		# no worries
+		$status = 'alot'
+	}
+	else {
+		# negative numbers
+		$n->nagios_die( ((caller(0))[3]).": scratch size has returned negative or something abominable: ".$scratchsize );
+	}
+
+	$statusmessage = sprintf( "Current scratch size: %d tapes", $scratchsize );
+	$n->add_perfdata( label => "Scratch total", value => $scratchsize, uom => '', min => $min, max => $max,
+		warning => $n->opts->warning, critical => $n->opts->critical );
+
+	return $scratchstatus{ $status }, $statusmessage;
+}
+
+sub get_numberoffilesperspacefile {
+
+	my $numberoffilesquery 		= "select filespaces.filespace_name, occupancy.num_files from filespaces,occupancy where ".
+								"filespaces.filespace_name=occupancy.filespace_name and filespaces.node_name='".uc( $node )."' and ".
+								"( filespaces.filespace_name <> '/' and filespaces.filespace_name not like '/home%' ) order by filespaces.filespace_name";
+	my %numberoffiles_result 	= dsmadmc( $numberoffilesquery );
+
+
+	my @keys 		= keys %numberoffiles_result;
+	my $hashsize 	= @keys;
+
+	for my $counter ( 0..($hashsize - 1) ) {
+
+		my $label 			= $numberoffiles_result{ $counter }{ 'FILESPACE_NAME' };
+		my $numberoffiles 	= $numberoffiles_result{ $counter }{ 'NUM_FILES' };
+
+		$n->add_perfdata( label => $label.": number of files", value => $numberoffiles, uom => '');
+
+		$counter++;
+	}
+
+	return 'OK', 'Tracking perfdata, no actual check';
+}
+
+main;
+
+### THE END ####
+
+
+__END__
+
+=head1 NAME
+
+check_tsm - Nagios
+
+=head1 NAME contains the module or script name, a dash and a short description.
+=head1 SYNOPSIS means "see together" and shows example usage.
+=head1 DESCRIPTION contains a long description of what the module does and lists functions.
+=head1 BUGS
+=head1 CAVEATS tells about bugs or issues the user should know about.
+=head1 ACKNOWLEDGEMENTS is where you thank bug fixers, testers and your parents.
+=head1 COPYRIGHT or LICENSE mentions copyright restrictions. Don't put the entire GPL there, though :)
+=head1 AVAILABILITY says where newer versions can be pulled from.
+=head1 AUTHOR explains who made it, if COPYRIGHT didn't already do so.
+=head1 SEE ALSO refers to additional documentation.
+
+=cut
